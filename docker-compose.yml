@@ -1,0 +1,142 @@
+services:
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: divp_postgres
+    environment:
+      POSTGRES_DB: divp_db
+      POSTGRES_USER: divp_user
+      POSTGRES_PASSWORD: divp_secret
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U divp_user -d divp_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  von-network:
+    image: ghcr.io/bcgov/von-network-base:latest
+    container_name: divp_von
+    command: bash -c "./scripts/start_nodes.sh"
+    ports:
+      - "9000:9000"
+      - "9701:9701"
+      - "9702:9702"
+      - "9703:9703"
+      - "9704:9704"
+    environment:
+      DOCKERHOST: host-gateway
+      LOG_LEVEL: WARNING
+    volumes:
+      - von_data:/home/indy/.indy_client
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/genesis"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  tails-server:
+    image: ghcr.io/bcgov/tails-server:latest
+    container_name: divp_tails
+    ports:
+      - "6543:6543"
+    environment:
+      TAILS_FILES_PATH: /tmp/tails-files
+      GENESIS_URL: http://von-network:9000/genesis
+    volumes:
+      - tails_data:/tmp/tails-files
+    depends_on:
+      von-network:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6543/"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  acapy:
+    image: ghcr.io/hyperledger/aries-cloudagent-python:py3.12-1.0.0
+    container_name: divp_acapy
+    ports:
+      - "8000:8000"
+      - "8001:8001"
+    environment:
+      ACAPY_GENESIS_URL: http://von-network:9000/genesis
+      ACAPY_TAILS_SERVER_BASE_URL: http://tails-server:6543
+      ACAPY_WALLET_TYPE: askar
+      ACAPY_WALLET_NAME: divp_base_wallet
+      ACAPY_WALLET_KEY: divp_wallet_key_change_in_prod
+      ACAPY_WALLET_STORAGE_TYPE: postgres_storage
+      ACAPY_WALLET_STORAGE_CONFIG: '{"url":"postgres:5432","wallet_scheme":"MultiWalletSingleTable"}'
+      ACAPY_WALLET_STORAGE_CREDS: '{"account":"divp_user","password":"divp_secret","admin_account":"divp_user","admin_password":"divp_secret"}'
+      ACAPY_MULTITENANT_ENABLED: "true"
+      ACAPY_MULTITENANT_ADMIN: "true"
+      ACAPY_MULTITENANT_JWT_SECRET: super_secret_jwt_key_change_in_prod
+      ACAPY_ADMIN_API_KEY: divp_admin_api_key
+      ACAPY_AUTO_PROVISION: "true"
+      ACAPY_LOG_LEVEL: WARNING
+    command: >
+      start
+      --inbound-transport http 0.0.0.0 8000
+      --outbound-transport http
+      --admin 0.0.0.0 8001
+      --admin-api-key divp_admin_api_key
+      --endpoint http://acapy:8000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      von-network:
+        condition: service_healthy
+      tails-server:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "-H", "X-Api-Key: divp_admin_api_key", "http://localhost:8001/status/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+
+  universal-resolver:
+    image: universalresolver/uni-resolver-web:latest
+    container_name: divp_resolver
+    ports:
+      - "8080:8080"
+
+  api:
+    build:
+      context: .
+      dockerfile: src/API/Dockerfile
+    container_name: divp_api
+    ports:
+      - "5000:8080"
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      ConnectionStrings__DefaultConnection: "Host=postgres;Port=5432;Database=divp_db;Username=divp_user;Password=divp_secret"
+      AcaPy__AdminUrl: http://acapy:8001
+      AcaPy__AdminApiKey: divp_admin_api_key
+      AcaPy__MultitenantJwtSecret: super_secret_jwt_key_change_in_prod
+      AcaPy__WebhookApiKey: divp_webhook_secret
+      DidResolver__BaseUrl: http://universal-resolver:8080
+      Jwt__Issuer: https://divp.local
+      Jwt__Audience: https://divp.local
+      Jwt__SecretKey: dev_jwt_secret_min_32_chars_long_x
+      Jwt__AccessTokenExpiryMinutes: "15"
+      Jwt__RefreshTokenExpiryDays: "7"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      acapy:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  von_data:
+  tails_data:
+
+networks:
+  default:
+    name: divp_network
